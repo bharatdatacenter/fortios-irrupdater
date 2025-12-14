@@ -1,8 +1,8 @@
-#!/bin/bash
-# Script for generating BGP filter for Mikrotik RouterOS
-# (c) 2023 Lee Hetherington <lee@edgenative.net>
+#!/bin/sh
+# Script for pushing BGP prefix-lists to FortiOS routers
+# (c) 2025 Ankesh Anand <ankesh@bharatdatacenter.com>
 
-path=/usr/share/mikrotik-irrupdater
+path=/usr/share/fortios-irrupdater
 
 # Check if the configuration file exists
 if [ ! -f $path/config/sessions.conf ]; then
@@ -11,23 +11,18 @@ if [ ! -f $path/config/sessions.conf ]; then
 fi
 
 # Read the input file line by line
-while IFS=',' read -r param1 param2 param3 param4; do
-    if [ -n "$param1" ] && [ -n "$param2" ]; then
-        # Check if param4 is specified and if it's IPv4 or IPv6
-        if [ -n "$param4" ]; then
-            if [ "$param4" = "ipv4" ]; then
-                # Run for IPv4 only
-                python3 $path/bin/mikrotik-irrupdater.py as$param1-$param2-import-ipv4 $path/filters/as$param1-$param2-import-ipv4.txt $param3
-            elif [ "$param4" = "ipv6" ]; then
-                # Run for IPv6 only
-                python3 $path/bin/mikrotik-irrupdater.py as$param1-$param2-import-ipv6 $path/filters/as$param1-$param2-import-ipv6.txt $param3
-            else
-                echo "Invalid value for session affinity: $param4"
-            fi
+while IFS=',' read -r asn slug router afi; do
+    afi=$(echo "$afi" | tr -d ' \r\n')
+    
+    if [ -n "$asn" ] && [ -n "$slug" ] && [ -n "$router" ] && [ -n "$afi" ]; then
+        if [ "$afi" = "ipv4" ]; then
+            # Run for IPv4 only
+            python3 $path/bin/fortios-irrupdater.py --router $router --asn $asn --slug $slug --afi $afi
+        elif [ "$afi" = "ipv6" ]; then
+            # Run for IPv6 only
+            python3 $path/bin/fortios-irrupdater.py --router $router --asn $asn --slug $slug --afi $afi
         else
-            # Run for both IPv4 and IPv6
-            python3 $path/bin/mikrotik-irrupdater.py as$param1-$param2-import-ipv4 $path/filters/as$param1-$param2-import-ipv4.txt $param3
-            python3 $path/bin/mikrotik-irrupdater.py as$param1-$param2-import-ipv6 $path/filters/as$param1-$param2-import-ipv6.txt $param3
+            echo "Invalid value for AFI: $afi"
         fi
     fi
 done < $path/config/sessions.conf
