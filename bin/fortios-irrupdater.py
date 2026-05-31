@@ -19,12 +19,14 @@ parser.add_argument("--router", help="IP address or hostname of the router", req
 parser.add_argument("--asn", help="ASN number", required=True)
 parser.add_argument("--slug", help="Peer slug name", required=True)
 parser.add_argument("--afi", help="Address family: ipv4 or ipv6", choices=['ipv4', 'ipv6'], required=True)
+parser.add_argument("--debug", help="Enable debug output", action='store_true')
 args = parser.parse_args()
 
 ROUTER_IP = args.router
 ASN = args.asn
 SLUG = args.slug
 PREFIX_LIST_NAME = f"as{ASN}-{SLUG}"
+DEBUG = args.debug
 
 config = configparser.ConfigParser()
 config_file = f"{path}/config/routers.conf"
@@ -191,13 +193,17 @@ def recv_until_prompt(shell, timeout=10):
             data = shell.recv(4096)
             if data:
                 output += data
-            if output.endswith(b"#") or output.endswith(b">"):
+            # Look for any FortiOS prompt: #, >, or $
+            if output.endswith(b"#") or output.endswith(b">") or output.endswith(b"$"):
                 break
         except:
             if output:
                 break
     shell.settimeout(None)
-    return output.decode('utf-8', errors='ignore')
+    decoded = output.decode('utf-8', errors='ignore')
+    if DEBUG and decoded.strip():
+        print(f"[DEBUG] Response: {decoded[:200]}")
+    return decoded
 
 def apply_updates(shell, prefix_list_name, to_add, to_delete, prefix_to_seq, is_ipv6=False, start_seq=10):
     shell.send(f"config router prefix-list{'6' if is_ipv6 else ''}\n")
@@ -250,6 +256,190 @@ def apply_updates(shell, prefix_list_name, to_add, to_delete, prefix_to_seq, is_
     shell.send("end\n")
     recv_until_prompt(shell)
 
+def get_current_addresses(ssh_client, is_ipv6=False):
+    """Get all current firewall addresses from the router"""
+    cmd = "show full-configuration firewall address"
+    if is_ipv6:
+        cmd = "show full-configuration firewall address6"
+    
+    stdin, stdout, stderr = ssh_client.exec_command(cmd)
+    
+    output = b""
+    stdout.channel.settimeout(0.5)
+    while True:
+        try:
+            data = stdout.channel.recv(8192)
+            if not data:
+                break
+            output += data
+        except socket.timeout:
+            try:
+                data = stdout.channel.recv(8192)
+                if data:
+                    output += data
+                else:
+                    break
+            except:
+                break
+    
+    text_output = output.decode('utf-8')
+    addresses = {}
+    current_name = None
+    
+    for line in text_output.split('\n'):
+        line = line.strip()
+        if line.startswith('edit '):
+            current_name = line.split('"')[1] if '"' in line else None
+        elif line.startswith('set subnet ') and current_name:
+            subnet = line.split(maxsplit=2)[2].strip()
+            addresses[current_name] = subnet
+        elif line.startswith('set ip6 ') and current_name:
+            ipv6 = line.split(maxsplit=2)[2].strip()
+            addresses[current_name] = ipv6
+    
+    return addresses
+
+def get_current_address_groups(ssh_client, is_ipv6=False):
+    """Get all current firewall address groups from the router"""
+    cmd = "show full-configuration firewall addrgrp"
+    if is_ipv6:
+        cmd = "show full-configuration firewall addrgrp6"
+    
+    stdin, stdout, stderr = ssh_client.exec_command(cmd)
+    
+    output = b""
+    stdout.channel.settimeout(0.5)
+    while True:
+        try:
+            data = stdout.channel.recv(8192)
+            if not data:
+                break
+            output += data
+        except socket.timeout:
+            try:
+                data = stdout.channel.recv(8192)
+                if data:
+                    output += data
+                else:
+                    break
+            except:
+                break
+    
+    text_output = output.decode('utf-8')
+    groups = {}
+    current_group = None
+    
+    for line in text_output.split('\n'):
+        line = line.strip()
+        if line.startswith('edit '):
+            current_group = line.split('"')[1] if '"' in line else None
+            if current_group:
+                groups[current_group] = set()
+        elif (line.startswith('set member ') or line.startswith('append member ')) and current_group:
+            # Extract all quoted values from the line (handles comma-separated list)
+            # Split by quotes and take odd-indexed elements (every other one contains the member name)
+            parts = line.split('"')
+            for i in range(1, len(parts), 2):
+                if parts[i].strip():
+                    groups[current_group].add(parts[i])
+    
+    return groups
+
+def apply_address_updates(shell, prefixes, is_ipv6=False):
+    """Create/update firewall addresses for the given prefixes"""
+    if not prefixes:
+        return
+    
+    addr_type = "address6" if is_ipv6 else "address"
+    cmd = f"config firewall {addr_type}"
+    
+    if DEBUG:
+        print(f"[DEBUG] Sending command: '{cmd}'")
+    
+    shell.send(cmd + "\n")
+    output = recv_until_prompt(shell)
+    
+    if "invalid" in output.lower() or "parse error" in output.lower():
+        print(f"    Error entering config firewall {addr_type}")
+        print(f"    Response: {output.strip()}")
+        return False
+    
+    success_count = 0
+    for prefix in prefixes:
+        address_name = prefix
+        shell.send(f'edit "{address_name}"\n')
+        output = recv_until_prompt(shell)
+        
+        if is_ipv6:
+            shell.send(f"set ip6 {prefix}\n")
+        else:
+            ip, cidr_str = prefix.split('/')
+            cidr = int(cidr_str)
+            netmask = cidr_to_netmask(cidr)
+            shell.send(f"set subnet {ip} {netmask}\n")
+        output = recv_until_prompt(shell)
+        
+        shell.send("next\n")
+        output = recv_until_prompt(shell)
+        success_count += 1
+    
+    shell.send("end\n")
+    output = recv_until_prompt(shell)
+    
+    return success_count
+
+def apply_address_group_updates(shell, group_name, members, is_ipv6=False):
+    """Create/update firewall address group with the given members"""
+    if not members:
+        return
+    
+    addrgrp_type = "addrgrp6" if is_ipv6 else "addrgrp"
+    cmd = f"config firewall {addrgrp_type}"
+    
+    if DEBUG:
+        print(f"[DEBUG] Sending command: '{cmd}'")
+    
+    shell.send(cmd + "\n")
+    output = recv_until_prompt(shell)
+    
+    if "invalid" in output.lower() or "parse error" in output.lower():
+        print(f"    Error entering config firewall {addrgrp_type}")
+        print(f"    Response: {output.strip()}")
+        return False
+    
+    shell.send(f'edit "{group_name}"\n')
+    output = recv_until_prompt(shell)
+    if DEBUG:
+        print(f"[DEBUG] After edit group: {repr(output[:100])}")
+    
+    # Add members one at a time to avoid line length issues
+    sorted_members = sorted(members)
+    if DEBUG:
+        print(f"[DEBUG] Setting {len(sorted_members)} members individually...")
+    
+    for i, member in enumerate(sorted_members):
+        if i == 0:
+            # First member uses 'set member'
+            shell.send(f'set member "{member}"\n')
+        else:
+            # Subsequent members use 'append member'
+            shell.send(f'append member "{member}"\n')
+        output = recv_until_prompt(shell)
+        if DEBUG and i < 3:  # Only debug first 3 members to avoid spam
+            print(f"[DEBUG] After member {i+1}: {repr(output[:50])}")
+    
+    shell.send("next\n")
+    output = recv_until_prompt(shell)
+    if DEBUG:
+        print(f"[DEBUG] After next: {repr(output[:100])}")
+    
+    shell.send("end\n")
+    output = recv_until_prompt(shell)
+    if DEBUG:
+        print(f"[DEBUG] After end: {repr(output[:100])}")
+    
+    return len(sorted_members)
+
 print(f"Connecting to {ROUTER_IP}...")
 ssh_client = paramiko.SSHClient()
 ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -283,6 +473,43 @@ try:
             print(f"  Updated")
         else:
             print(f"  No changes")
+        
+        # Create/update firewall addresses and address groups
+        if desired_ipv4:
+            print(f"Processing Address Group: AS{ASN} (IPv4)...")
+            current_addresses = get_current_addresses(ssh_client, is_ipv6=False)
+            current_groups = get_current_address_groups(ssh_client, is_ipv6=False)
+            
+            # Addresses to create (those not already present)
+            addresses_to_create = desired_ipv4 - set(current_addresses.keys())
+            
+            # Check if group needs updating
+            group_name = f"AS{ASN}"
+            current_members = current_groups.get(group_name, set())
+            members_match = current_members == desired_ipv4
+            
+            if addresses_to_create or group_name not in current_groups or not members_match:
+                shell = ssh_client.invoke_shell()
+                recv_until_prompt(shell)
+                
+                # Create new addresses and address group in a single session
+                if addresses_to_create:
+                    print(f"  Creating {len(addresses_to_create)} addresses...")
+                    addr_result = apply_address_updates(shell, addresses_to_create, is_ipv6=False)
+                    if addr_result:
+                        print(f"  Created {addr_result} addresses")
+                    else:
+                        print(f"  Warning: Address creation may have failed")
+                
+                # Create or update address group
+                print(f"  Updating address group AS{ASN}...")
+                group_result = apply_address_group_updates(shell, group_name, desired_ipv4, is_ipv6=False)
+                if group_result:
+                    print(f"  Address group updated with {group_result} members")
+                else:
+                    print(f"  Warning: Address group update may have failed")
+            else:
+                print(f"  Address group AS{ASN} already up-to-date")
 
     elif args.afi == 'ipv6':
         print(f"Processing {PREFIX_LIST_NAME} (IPv6)...")
@@ -304,6 +531,43 @@ try:
             print(f"  Updated")
         else:
             print(f"  No changes")
+        
+        # Create/update firewall addresses and address groups
+        if desired_ipv6:
+            print(f"Processing Address Group: AS{ASN}_6 (IPv6)...")
+            current_addresses = get_current_addresses(ssh_client, is_ipv6=True)
+            current_groups = get_current_address_groups(ssh_client, is_ipv6=True)
+            
+            # Addresses to create (those not already present)
+            addresses_to_create = desired_ipv6 - set(current_addresses.keys())
+            
+            # Check if group needs updating
+            group_name = f"AS{ASN}_6"
+            current_members = current_groups.get(group_name, set())
+            members_match = current_members == desired_ipv6
+            
+            if addresses_to_create or group_name not in current_groups or not members_match:
+                shell = ssh_client.invoke_shell()
+                recv_until_prompt(shell)
+                
+                # Create new addresses and address group in a single session
+                if addresses_to_create:
+                    print(f"  Creating {len(addresses_to_create)} addresses...")
+                    addr_result = apply_address_updates(shell, addresses_to_create, is_ipv6=True)
+                    if addr_result:
+                        print(f"  Created {addr_result} addresses")
+                    else:
+                        print(f"  Warning: Address creation may have failed")
+                
+                # Create or update address group
+                print(f"  Updating address group AS{ASN}_6...")
+                group_result = apply_address_group_updates(shell, group_name, desired_ipv6, is_ipv6=True)
+                if group_result:
+                    print(f"  Address group updated with {group_result} members")
+                else:
+                    print(f"  Warning: Address group update may have failed")
+            else:
+                print(f"  Address group AS{ASN}_6 already up-to-date")
 
 except paramiko.AuthenticationException:
     print(f"Authentication failed for {ROUTER_IP}")
